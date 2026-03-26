@@ -3,6 +3,7 @@ const express = require("express");
 const cors = require("cors");
 const bodyParser = require("body-parser");
 const mongoose = require("mongoose");
+const crypto = require("crypto");
 
 const app = express();
 app.use(cors());
@@ -12,8 +13,8 @@ app.use(bodyParser.json());
 const PORT = process.env.PORT || 3000;
 const ADMIN_SECRET = process.env.ADMIN_SECRET || "MY_ADMIN_PASSWORD_123";
 const DISCORD_WEBHOOK_URL = process.env.DISCORD_WEBHOOK_URL || "";
-const MONGO_URI = process.env.MONGO_URI; // You must set this in Render!
-const GEMINI_API_KEY = process.env.GEMINI_API_KEY; // ADD THIS to your Render environment variables
+const MONGO_URI = process.env.MONGO_URI; 
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY; 
 
 // --- MONGODB CONNECTION ---
 if (!MONGO_URI) {
@@ -43,7 +44,6 @@ const licenseSchema = new mongoose.Schema({
     default: Date.now,
     expires: 86400, // 86400 seconds = 24 Hours
   },
-  // Optional: Track usage
   lastUsed: { type: Date },
   usageCount: { type: Number, default: 0 },
 });
@@ -74,11 +74,11 @@ app.get("/generate", async (req, res) => {
     return res.status(403).send("Unauthorized");
   }
 
-  const key =
-    "KEY-" + Math.random().toString(36).substring(2, 15).toUpperCase();
+  // Generate cryptographically secure random 16 character key
+  const randomPart = crypto.randomBytes(8).toString("hex").toUpperCase();
+  const key = `KEY-${randomPart}`;
 
   try {
-    // Save to MongoDB
     const newLicense = new License({ key: key });
     await newLicense.save();
 
@@ -95,50 +95,119 @@ app.get("/generate", async (req, res) => {
   }
 });
 
-// 2. VALIDATE KEY (Updated to return Gemini API Key)
+// 2. VALIDATE KEY (Client check)
+// Secure version: No longer returns raw GEMINI_API_KEY to client
 app.post("/validate", async (req, res) => {
   const { key } = req.body;
 
-  if (!key) {
-    return res.json({ valid: false, message: "No key provided" });
-  }
+  if (!key) return res.json({ valid: false, message: "No key provided" });
 
   try {
-    // Find key in MongoDB
     const license = await License.findOne({ key: key });
+    const now = new Date();
 
-    // If license is null, it either never existed OR MongoDB already auto-deleted it
     if (!license) {
       await sendDiscordNotification(`⚠️ Failed login attempt: ${key}`);
       return res.json({ valid: false, message: "Invalid or Expired Key" });
     }
 
-    // Update usage tracking (optional)
-    license.lastUsed = new Date();
+    const expiresAt = new Date(license.createdAt.getTime() + 86400 * 1000);
+    
+    // Strict gap check (MongoDB TTL can take 60s+ to trigger)
+    if (now > expiresAt) {
+      return res.json({ valid: false, message: "Invalid or Expired Key" });
+    }
+
+    license.lastUsed = now;
     license.usageCount += 1;
     await license.save();
 
-    // Calculate expiry time
-    const expiresAt = new Date(license.createdAt.getTime() + 86400 * 1000);
-    const hoursRemaining = Math.max(
-      0,
-      Math.floor((expiresAt - new Date()) / (1000 * 60 * 60))
-    );
+    const hoursRemaining = Math.max(0, Math.floor((expiresAt - now) / (1000 * 60 * 60)));
 
     await sendDiscordNotification(
       `✅ Successful login with key: ${key} (${hoursRemaining}h remaining, ${license.usageCount} total uses)`
     );
 
-    // IMPORTANT: Return the Gemini API key to the client
     return res.json({
       valid: true,
-      geminiApiKey: GEMINI_API_KEY, // Send API key after validation
       expiresAt: expiresAt.toISOString(),
       hoursRemaining: hoursRemaining,
     });
   } catch (error) {
     console.error(error);
     return res.status(500).json({ valid: false, message: "Server Error" });
+  }
+});
+
+// 2.5. GEMINI API PROXY
+// Protects your real API Key. Forward all /v1 and /v1beta traffic to Google safely.
+app.use(['/v1', '/v1beta'], async (req, res) => {
+  // Client passes their LICENSE KEY as the api key via header or query
+  const providedKey = req.query.key || req.headers["x-goog-api-key"];
+
+  if (!providedKey) {
+    return res.status(401).json({ error: { message: "API key not valid. Please pass a valid API key." } });
+  }
+
+  try {
+    const license = await License.findOne({ key: providedKey });
+    const now = new Date();
+
+    if (!license) {
+      return res.status(403).json({ error: { message: "Invalid or expired license key." } });
+    }
+    
+    const expiresAt = new Date(license.createdAt.getTime() + 86400 * 1000);
+    if (now > expiresAt) {
+      return res.status(403).json({ error: { message: "License key has expired." } });
+    }
+
+    // Unblocking usage update
+    license.lastUsed = now;
+    license.usageCount += 1;
+    license.save().catch(err => console.error("Proxy usage update error:", err));
+
+    // Construct Google API URL using req.originalUrl to keep exact path and queries
+    const urlObj = new URL(`https://generativelanguage.googleapis.com${req.originalUrl}`);
+    
+    // SECURITY: Replace the client's license key with the server's real GEMINI_API_KEY
+    urlObj.searchParams.set("key", GEMINI_API_KEY);
+
+    const fetchOptions = {
+      method: req.method,
+      headers: {
+        "Content-Type": req.headers["content-type"] || "application/json",
+      },
+      // Include body for POST/PUT/PATCH
+      ...(req.method !== "GET" && req.method !== "HEAD" && { body: JSON.stringify(req.body) })
+    };
+
+    const response = await fetch(urlObj.toString(), fetchOptions);
+    
+    // Pass Google's identical headers and status back to the client
+    res.status(response.status);
+    response.headers.forEach((value, header) => {
+      // Exclude problematic headers
+      if (header.toLowerCase() !== 'content-encoding') {
+         res.setHeader(header, value);
+      }
+    });
+
+    // Stream response chunks for native SSE compatibility (streamGenerateContent)
+    if (response.body) {
+      const reader = response.body.getReader();
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        res.write(value);
+      }
+      res.end();
+    } else {
+      res.end();
+    }
+  } catch (error) {
+    console.error("Proxy error:", error);
+    res.status(500).json({ error: { message: "Internal server proxy error" } });
   }
 });
 
@@ -184,7 +253,8 @@ app.get("/list", async (req, res) => {
 
 // 4. DELETE KEY (Admin only - manual deletion)
 app.delete("/delete", async (req, res) => {
-  const { secret, key } = req.body;
+  // Refactored to req.query since DELETE body is frequently stripped by HTTP clients
+  const { secret, key } = req.query;
 
   if (secret !== ADMIN_SECRET) {
     return res.status(403).send("Unauthorized");
@@ -210,7 +280,7 @@ app.delete("/delete", async (req, res) => {
 });
 
 app.get("/", (req, res) => {
-  res.send("Interview Guide Server is Running with MongoDB ✅");
+  res.send("Interview Guide Server is Running with Proxy & MongoDB ✅");
 });
 
 app.listen(PORT, () => {
